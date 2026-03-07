@@ -22,6 +22,8 @@
         .scrollbar-hide::-webkit-scrollbar { display: none; }
         .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
         * { -webkit-tap-highlight-color: transparent; }
+        /* Style crucial pour forcer Leaflet à prendre la hauteur */
+        .leaflet-container { height: 100%; width: 100%; z-index: 10; }
     </style>
 </head>
 <body class="bg-zinc-100 text-zinc-800 antialiased">
@@ -69,7 +71,6 @@
         const safeGetLocal = (key) => { try { return localStorage.getItem(key) || ''; } catch(e) { return ''; } };
         const safeSetLocal = (key, value) => { try { localStorage.setItem(key, value); } catch(e) {} };
         
-        // Optimisation: Dictionnaire d'icônes extrait du composant pour éviter la recréation
         const SVG_ICONS = {
             map: <g><path d="M1 6v16l7-4 8 4 7-4V2l-7 4-8-4-7 4z"></path><line x1="8" y1="2" x2="8" y2="18"></line><line x1="16" y1="6" x2="16" y2="22"></line></g>,
             "map-pin": <g><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></g>,
@@ -123,28 +124,45 @@
             return null;
         };
 
-        const geocodeAddress = async (address) => {
+        // GÉOCODAGE PLUS INTELLIGENT
+        const geocodeAddress = async (address, name, country) => {
             if (!address || address === 'À définir') return { coords: null, fromCache: false };
-            const cacheKey = `geocode_v2_${address.trim().toLowerCase()}`;
-            const cached = safeGetLocal(cacheKey);
-            if (cached) {
-                try {
-                    const parsed = JSON.parse(cached);
-                    return { coords: parsed === 'not_found' ? null : parsed, fromCache: true };
-                } catch (e) {}
-            }
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-                const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`, { headers: { 'User-Agent': 'MonGrandVoyageApp/1.0' } });
-                if (!res.ok) return { coords: null, fromCache: false };
-                const data = await res.json();
-                if (data && data.length > 0) {
-                    const coords = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
-                    safeSetLocal(cacheKey, JSON.stringify(coords));
-                    return { coords, fromCache: false };
+            
+            const cleanName = (name || '').split('(')[0].trim();
+            const queryCountry = country || detectCountry(address) || '';
+            
+            const queries = [
+                address,
+                cleanName && queryCountry ? `${cleanName}, ${queryCountry}` : null,
+                cleanName
+            ].filter(q => q && q.length > 2);
+
+            for (const query of queries) {
+                const cacheKey = `geocode_v2_${query.trim().toLowerCase()}`;
+                const cached = safeGetLocal(cacheKey);
+                
+                if (cached) {
+                    try {
+                        const parsed = JSON.parse(cached);
+                        if (parsed !== 'not_found') return { coords: parsed, fromCache: true };
+                    } catch (e) {}
+                    continue; 
                 }
-            } catch (e) {}
-            safeSetLocal(cacheKey, JSON.stringify('not_found'));
+
+                await new Promise(r => setTimeout(r, 2000)); 
+                try {
+                    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`, { headers: { 'User-Agent': 'MonGrandVoyageApp/1.0' } });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data && data.length > 0) {
+                            const coords = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+                            safeSetLocal(cacheKey, JSON.stringify(coords));
+                            return { coords, fromCache: false };
+                        }
+                    }
+                } catch (e) {}
+                safeSetLocal(cacheKey, JSON.stringify('not_found'));
+            }
             return { coords: null, fromCache: false };
         };
 
@@ -178,7 +196,6 @@
         // COMPOSANTS EXTRAITS
         // =====================================================================
 
-        // Composant Carte d'Activité
         const ActivityCard = React.memo(({ activity, isPlanner, showTime, showCountry, isExpanded, onToggle, onEdit, onDelete, onAssign, getDayDisplayName, days }) => {
             const borderColor = activity.type === 'restaurant' ? 'border-l-orange-400' : 'border-l-blue-400';
             const displayCountry = activity.country || detectCountry(activity.address);
@@ -262,7 +279,7 @@
             );
         });
 
-        // Composant Map Leaflet
+        // Composant Map Leaflet CORRIGÉ AVEC HAUTEUR GARANTIE
         const MapComponent = React.memo(({ activities, countryFilter }) => {
             const mapRef = useRef(null);
             const mapInstanceRef = useRef(null);
@@ -270,11 +287,26 @@
 
             useEffect(() => {
                 if (!mapInstanceRef.current && mapRef.current) {
+                    // Initialiser la carte
                     mapInstanceRef.current = L.map(mapRef.current).setView([20, 0], 2);
-                    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { attribution: '&copy; OSM', maxZoom: 19 }).addTo(mapInstanceRef.current);
+                    
+                    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { 
+                        attribution: '&copy; OSM', 
+                        maxZoom: 19 
+                    }).addTo(mapInstanceRef.current);
+                    
                     markersLayerRef.current = L.layerGroup().addTo(mapInstanceRef.current);
                 }
 
+                // Force Leaflet à recalculer sa taille au montage (très important dans les onglets React)
+                const resizeTimer = setTimeout(() => {
+                    if (mapInstanceRef.current) mapInstanceRef.current.invalidateSize();
+                }, 300);
+
+                return () => clearTimeout(resizeTimer);
+            }, []);
+
+            useEffect(() => {
                 if (mapInstanceRef.current && markersLayerRef.current) {
                     markersLayerRef.current.clearLayers();
                     const bounds = [];
@@ -289,15 +321,15 @@
                             const markerColor = act.type === 'restaurant' ? '#f97316' : '#6366f1';
                             const customIcon = L.divIcon({
                                 className: 'custom-div-icon',
-                                html: `<div style="background-color: ${markerColor}; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 5px rgba(0,0,0,0.3);"></div>`,
-                                iconSize: [14, 14], iconAnchor: [7, 7]
+                                html: `<div style="background-color: ${markerColor}; width: 16px; height: 16px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 5px rgba(0,0,0,0.4);"></div>`,
+                                iconSize: [16, 16], iconAnchor: [8, 8]
                             });
 
                             const marker = L.marker([act.coordinates.lat, act.coordinates.lon], {icon: customIcon})
                                 .bindPopup(`
-                                    <div style="text-align: center; padding: 4px;">
+                                    <div style="text-align: center; padding: 4px; min-width: 120px;">
                                         <b style="font-size: 14px;">${act.name}</b><br>
-                                        <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(act.address)}" target="_blank" style="display: inline-block; margin-top: 8px; background: #18181b; color: white; padding: 4px 10px; border-radius: 6px; text-decoration: none; font-size: 11px;">Ouvrir Maps</a>
+                                        <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(act.address)}" target="_blank" style="display: inline-block; margin-top: 8px; background: #18181b; color: white; padding: 6px 12px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: bold;">Ouvrir Maps</a>
                                     </div>
                                 `);
                             markersLayerRef.current.addLayer(marker);
@@ -305,11 +337,12 @@
                         }
                     });
 
-                    if (bounds.length > 0) mapInstanceRef.current.fitBounds(bounds, { padding: [30, 30], maxZoom: 14 });
-                    else if (countryFilter === 'all') mapInstanceRef.current.setView([20, 0], 2);
+                    if (bounds.length > 0) {
+                        mapInstanceRef.current.fitBounds(bounds, { padding: [30, 30], maxZoom: 14 });
+                    } else if (countryFilter === 'all') {
+                        mapInstanceRef.current.setView([20, 0], 2);
+                    }
                 }
-                
-                setTimeout(() => mapInstanceRef.current?.invalidateSize(), 100);
             }, [activities, countryFilter]);
 
             return <div ref={mapRef} style={{ width: '100%', height: '100%', zIndex: 1 }} />;
@@ -323,23 +356,19 @@
             const [isInitializing, setIsInitializing] = useState(true);
             const [authError, setAuthError] = useState(null);
             
-            // Données
             const [activities, setActivities] = useState([]);
             const [settings, setSettings] = useState({ startDate: '', days: [{ id: 'day-1', label: 'Jour 1', hotelAddress: '' }] });
             
-            // Navigation & UI
             const [activeTab, setActiveTab] = useState('backlog');
             const [activeDayId, setActiveDayId] = useState('day-1');
             const [journalFilter, setJournalFilter] = useState('all');
             const [mapCountryFilter, setMapCountryFilter] = useState('all');
             const [expandedIds, setExpandedIds] = useState(new Set());
             
-            // Modales
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [isJournalModalOpen, setIsJournalModalOpen] = useState(false);
             const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
             
-            // Formulaires & IA
             const [editingActivity, setEditingActivity] = useState(null);
             const [activityForm, setActivityForm] = useState({ name: '', type: 'visite', address: '', country: '', duration: '', time: '10:00', dayId: '', url: '', photos: [], notes: '', period: 'morning' });
             
@@ -358,6 +387,8 @@
             const [isAiRewriting, setIsAiRewriting] = useState(false);
             const [isUpdatingData, setIsUpdatingData] = useState(false);
             const [updateMessage, setUpdateMessage] = useState('');
+            
+            const isGeocodingRef = useRef(false);
 
             // INIT FIREBASE
             useEffect(() => {
@@ -384,28 +415,40 @@
                 return () => { unsubSet(); unsubAct(); };
             }, [user]);
 
-            // GEOCODING WORKER
+            // GEOCODING WORKER STABLE
             useEffect(() => {
-                if (!user || activeTab !== 'map') return;
-                const toGeocode = activities.filter(a => !a.coordinates && a.address && a.address !== 'À définir');
+                if (!user || activeTab !== 'map' || isGeocodingRef.current) return;
+                
+                const toGeocode = activities.filter(a => !a.coordinates && !a.geocodeFailed && a.address && a.address !== 'À définir');
                 if (!toGeocode.length) return;
                 
                 let isMounted = true;
-                let i = 0;
-                const run = async () => {
-                    if (i < toGeocode.length && activeTab === 'map' && isMounted) {
+                isGeocodingRef.current = true;
+                
+                const runGeocoding = async () => {
+                    for (let i = 0; i < toGeocode.length; i++) {
+                        if (!isMounted || activeTab !== 'map') break; 
+                        
                         const act = toGeocode[i];
-                        const { coords } = await geocodeAddress(act.address);
-                        if (coords) await db.doc(`trips/${tripId}/activities/${act.id}`).update({ coordinates: coords });
-                        i++;
-                        setTimeout(run, 50);
+                        const { coords } = await geocodeAddress(act.address, act.name, act.country);
+                        
+                        try {
+                            if (coords) {
+                                await db.doc(`trips/${tripId}/activities/${act.id}`).update({ coordinates: coords, geocodeFailed: false });
+                            } else {
+                                await db.doc(`trips/${tripId}/activities/${act.id}`).update({ geocodeFailed: true });
+                            }
+                        } catch(e) {}
                     }
+                    isGeocodingRef.current = false;
                 };
-                run();
-                return () => { isMounted = false; };
+                
+                runGeocoding();
+                
+                return () => { isMounted = false; isGeocodingRef.current = false; };
             }, [activities, user, activeTab]);
 
-            // CALCULS MEMORISÉS (Optimisation Performance)
+            // CALCULS MEMORISÉS
             const getDayDisplayName = useCallback((dayId) => {
                 const index = settings.days.findIndex(d => d.id === dayId);
                 if (index === -1) return 'Jour inconnu';
@@ -448,6 +491,10 @@
                 });
             }, [activities, journalFilter, settings.days]);
 
+            const failedGeocodeActivities = useMemo(() => {
+                return activities.filter(a => a.geocodeFailed && (!mapCountryFilter || mapCountryFilter === 'all' || a.country === mapCountryFilter));
+            }, [activities, mapCountryFilter]);
+
             // ACTIONS
             const toggleExpand = useCallback((id) => {
                 setExpandedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -466,7 +513,16 @@
 
             const saveActivity = async (e) => {
                 e.preventDefault();
-                const data = { ...activityForm, country: activityForm.country || detectCountry(activityForm.address) || '' };
+                let finalCountry = activityForm.country || detectCountry(activityForm.address) || '';
+                const data = { ...activityForm, country: finalCountry };
+                
+                if (editingActivity && editingActivity.address !== activityForm.address) {
+                    data.coordinates = null;
+                    data.geocodeFailed = false;
+                } else if (!editingActivity) {
+                    data.geocodeFailed = false;
+                }
+
                 if (editingActivity) await db.doc(`trips/${tripId}/activities/${editingActivity.id}`).update(data);
                 else await db.collection(`trips/${tripId}/activities`).add(data);
                 setIsModalOpen(false);
@@ -527,16 +583,44 @@
                         <main className="flex-grow p-4 space-y-6 overflow-x-hidden">
                             {/* CARTE */}
                             {activeTab === 'map' && (
-                                <section className="animate-in fade-in duration-200 flex flex-col h-[calc(100vh-200px)]">
-                                    <div className="flex justify-between items-center mb-4">
+                                <section className="animate-in fade-in duration-200 space-y-4">
+                                    <div className="flex justify-between items-center">
                                         <h2 className="text-sm font-semibold text-zinc-800 uppercase tracking-wide">Carte globale</h2>
-                                        <select value={mapCountryFilter} onChange={(e) => setMapCountryFilter(e.target.value)} className="bg-white border border-zinc-200 text-zinc-700 text-xs py-1.5 px-3 rounded-lg outline-none">
+                                        <select value={mapCountryFilter} onChange={(e) => setMapCountryFilter(e.target.value)} className="bg-white border border-zinc-200 text-zinc-700 text-xs py-1.5 px-3 rounded-lg outline-none shadow-sm">
                                             <option value="all">Tous les pays</option>
                                             {sortedCountries.map(c => <option key={c} value={c}>{c}</option>)}
                                         </select>
                                     </div>
-                                    <div className="flex-grow bg-zinc-200 rounded-xl overflow-hidden shadow-inner border border-zinc-300">
+                                    
+                                    {/* Conteneur avec HAUTEUR FIXE pour empêcher le bug d'affichage */}
+                                    <div className="w-full h-[50vh] min-h-[350px] bg-zinc-200 rounded-xl overflow-hidden shadow-inner border border-zinc-300 relative z-0">
                                         <MapComponent activities={activities} countryFilter={mapCountryFilter} />
+                                    </div>
+                                    
+                                    <div className="space-y-2">
+                                        <p className="text-[10px] text-zinc-500 text-center">
+                                            Tous vos lieux (À faire et Planifiés) s'affichent sur la carte.
+                                        </p>
+                                        
+                                        {/* Liste des lieux introuvables */}
+                                        {failedGeocodeActivities.length > 0 && (
+                                            <div className="bg-orange-50 border border-orange-100 rounded-xl p-3 shadow-sm max-h-48 overflow-y-auto scrollbar-hide">
+                                                <p className="text-xs text-orange-700 font-bold mb-2 flex items-center gap-1.5">
+                                                    ⚠️ {failedGeocodeActivities.length} lieu(x) introuvable(s) :
+                                                </p>
+                                                <ul className="space-y-1.5">
+                                                    {failedGeocodeActivities.map(act => (
+                                                        <li key={act.id} className="text-xs text-zinc-800 flex justify-between items-center bg-white p-2 rounded-lg border border-orange-100 shadow-sm">
+                                                            <span className="truncate pr-2 font-medium">{act.name}</span>
+                                                            <button onClick={() => openActivityModal(act)} className="text-indigo-600 hover:text-indigo-800 flex-shrink-0 bg-indigo-50 px-2 py-1 rounded-md text-[10px] font-bold transition-colors">
+                                                                Modifier
+                                                            </button>
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                                <p className="text-[10px] text-orange-600/80 mt-2 italic leading-tight">Astuce: Essayez de simplifier l'adresse ou supprimez les infos inutiles (ex: 2ème étage).</p>
+                                            </div>
+                                        )}
                                     </div>
                                 </section>
                             )}
